@@ -1,6 +1,8 @@
 /* Copyright 2023 Lennart Augustsson
  * See LICENSE file for full license.
  */
+#include <stdbool.h>
+#include <uv.h>
 #include <inttypes.h>
 #if WANT_STDIO
 #include <stdio.h>
@@ -3798,7 +3800,175 @@ void mhs_chdir(int s) { mhs_from_Int(s, 1, chdir(mhs_to_Ptr(s, 0))); }
 void mhs_mkdir(int s) { mhs_from_Int(s, 2, mkdir(mhs_to_Ptr(s, 0), mhs_to_Int(s, 1))); }
 #endif  /* WANT_DIR */
 
+struct sockaddr_in6 srv_addr;
+uv_tcp_t tcp[1];
+uv_tcp_t clients[1];
+struct read_data {
+  bool triggered; /* unless this is set, the callback wasn't triggered yet */
+  bool failed; /* when set, this read_data can be deallocated because it won't get filled again (connection died or similar) */
+  ssize_t amount_read; /* refers to next field */
+  char read_bytes[8192];
+};
+
+uv_loop_t loop;
+
+void mhs_llabs(int s) { mhs_from_Int(s, 1, llabs(mhs_to_Int(s,0))); }
+void mhs_uv_loop_init(int s) { mhs_from_Int(s,0,uv_loop_init(&loop)); }
+void mhs_uv_tcp_init(int s) {
+  int idx = mhs_to_Int(s,0);
+  if (idx != 0) abort();
+  mhs_from_Int(s,1,uv_tcp_init(&loop, &tcp[idx]));
+}
+
+struct read_data cbdata[1] = { {.triggered= false, .failed=false, .amount_read=0, .read_bytes={0} } };
+
+void mhs_uv_tcp_bind(int s) {
+  memset(&srv_addr, 0, sizeof srv_addr);
+  srv_addr.sin6_family = AF_INET6;
+  srv_addr.sin6_port = htons(8080);
+  int ret = inet_pton(AF_INET6, "::1", &srv_addr.sin6_addr);
+  if (ret == -1) {
+      puts("inet_pton()");
+      abort();
+  }
+
+  if (ret == 0) {
+      puts("Invalid IPV6 network address given");
+      abort();
+  }
+  int idx = mhs_to_Int(s,0);
+  if (idx != 0) abort();
+  mhs_from_Int(s,1,uv_tcp_bind(&tcp[idx],(const struct sockaddr *) &srv_addr,UV_TCP_IPV6ONLY));
+}
+
+
+void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+  buf->base = (char*) malloc(suggested_size);
+  buf->len = suggested_size;
+}
+
+void accept_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
+  ptrdiff_t diff = (uv_tcp_t*) client - &clients[0];
+  int idx = diff;
+  cbdata[idx].triggered = true;
+  if (nread < 0) {
+    if (nread != UV_EOF) {
+      fprintf(stderr, "Read error %s\n", uv_err_name(nread));
+    }
+    cbdata[idx].failed = true;
+    uv_close((uv_handle_t*) client, NULL);
+  } else if (nread > 0) {
+    cbdata[idx].failed = false;
+    //printf("Read data: %s, data=%s\n", buf->base, client->data);
+    if (nread > 8192)
+      cbdata[idx].amount_read = 8192;
+    else
+      cbdata[idx].amount_read = nread;
+    memcpy(cbdata[idx].read_bytes, buf->base, cbdata[idx].amount_read);
+  }
+
+  if (buf->base) {
+    free(buf->base);
+  }
+}
+
+void new_connection_callback(uv_stream_t *server, int status) {
+  if (status < 0) {
+    fprintf(stderr, "New connection error %s\n", uv_strerror(status));
+    return;
+  }
+  fprintf(stderr, "conn cb\n");
+  fflush(stderr);
+
+  ptrdiff_t diff = (uv_tcp_t*) server - &tcp[0] ;
+
+  // client "socket"
+  uv_tcp_t *client = &clients[diff];
+  uv_tcp_init(&loop, client);
+  if (uv_accept(server, (uv_stream_t*) client) == 0) {
+    uv_read_start((uv_stream_t*) client, alloc_buffer, accept_callback);
+  } else {
+    uv_close((uv_handle_t*) client, NULL);
+  }
+
+}
+
+
+void mhs_uv_listen(int s) {
+  int idx = mhs_to_Int(s,0);
+  if (idx != 0) abort();
+  mhs_from_Int(s,2,uv_listen(&tcp[idx],mhs_to_Int(s,1),new_connection_callback));
+}
+
+void mhs_uv_run_once(int s) {
+  mhs_from_Int(s,0,uv_run(&loop, UV_RUN_ONCE));
+}
+
+void mhs_janus_get_nread(int s) {
+  int idx = mhs_to_Int(s,0);
+  mhs_from_Int(s,1,cbdata[idx].amount_read);
+}
+
+void mhs_janus_get_data(int s) {
+  int idx = mhs_to_Int(s,0);
+  mhs_from_Ptr(s,1,cbdata[idx].read_bytes);
+}
+
+void mhs_janus_get_failed(int s) {
+  int idx = mhs_to_Int(s,0);
+  mhs_from_Int(s,1,cbdata[idx].failed);
+}
+
+void mhs_janus_get_triggered(int s) {
+  int idx = mhs_to_Int(s,0);
+  mhs_from_Int(s,1,cbdata[idx].triggered);
+  cbdata[idx].triggered = false;
+}
+
+typedef struct {
+    uv_write_t req;
+    uv_buf_t buf;
+} write_req_t;
+
+void free_write_req(uv_write_t *req) {
+    write_req_t *wr = (write_req_t*) req;
+    free(wr->buf.base);
+    free(wr);
+}
+
+void echo_write(uv_write_t *req, int status) {
+    if (status) {
+        fprintf(stderr, "Write error %s\n", uv_strerror(status));
+    }
+    free_write_req(req);
+}
+
+void mhs_janus_write(int s) {
+  int idx = mhs_to_Int(s,0);
+  const char* ptr = mhs_to_Ptr(s,1);
+  const int len = strlen(ptr);
+  char* copy = malloc(len+1);
+  strcpy(copy,ptr);
+
+  write_req_t *req = (write_req_t*) malloc(sizeof(write_req_t));
+  req->buf = uv_buf_init(copy, len);
+  uv_write((uv_write_t*) req, &clients[idx], &req->buf, 1, echo_write);
+
+  mhs_from_Int(s,2,len);
+}
+
+
 struct ffi_entry ffi_table[] = {
+{"uv_loop_init",mhs_uv_loop_init},
+{"uv_tcp_init",mhs_uv_tcp_init},
+{"uv_tcp_bind",mhs_uv_tcp_bind},
+{"uv_listen",mhs_uv_listen},
+{"uv_run_once",mhs_uv_run_once},
+{"janus_get_nread",mhs_janus_get_nread},
+{"janus_get_data",mhs_janus_get_data},
+{"janus_get_failed",mhs_janus_get_failed},
+{"janus_get_triggered",mhs_janus_get_triggered},
+{"janus_write",mhs_janus_write},
 { "GETRAW", mhs_GETRAW},
 { "GETTIMEMILLI", mhs_GETTIMEMILLI},
 #if WANT_MATH

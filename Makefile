@@ -5,7 +5,7 @@ CONF=unix-64
 #
 CCWARNS= -Wall
 CCOPTS= -O3
-CCLIBS= -lm
+CCLIBS= -lm -luv
 CCEVAL= $(CC) $(CCWARNS) $(CCOPTS) -Isrc/runtime src/runtime/eval-$(CONF).c $(CCLIBS)
 #
 GHC= ghc
